@@ -1,0 +1,9 @@
+streamlit==1.58.0
+streamlit-folium==0.27.2
+folium==0.20.0
+osmnx==2.1.0
+networkx==3.6.1
+scipy==1.17.1
+numpy==2.4.6
+# osmnx 在經緯度（未投影）路網上找最近節點時需要，但不會隨 osmnx 自動安裝
+scikit-learn==1.9.0

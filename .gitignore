@@ -1,0 +1,5 @@
+__pycache__/
+.pytest_cache/
+.DS_Store
+# osmnx 的 Overpass API 下載快取；已有 taipei_city.graphml 就用不到
+cache/
