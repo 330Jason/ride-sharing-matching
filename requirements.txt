@@ -7,3 +7,5 @@ scipy==1.17.1
 numpy==2.4.6
 # osmnx 在經緯度（未投影）路網上找最近節點時需要，但不會隨 osmnx 自動安裝
 scikit-learn==1.9.0
+# live_data.py 驗證 HTTPS 用的根憑證清單；憑證要能隨時更新，只設下限不鎖版本
+certifi>=2026.2.25

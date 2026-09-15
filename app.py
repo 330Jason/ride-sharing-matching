@@ -9,27 +9,42 @@
 3. 按「計算配對」：套用最新封路狀態，MatchingEngine 求全局最佳配對，
    MapRoutingAdapter 在繞過封鎖路口的前提下算出真實街道路徑並畫線。
 4. 地圖視角（中心/縮放）跨 rerun 保留，點擊不會跳回預設位置。
+5. 按「載入即時範例」：抓取臺北市公車此刻的 GPS 位置當司機，
+   並在目前地圖畫面內隨機挑路口當乘客。
 """
 
 from __future__ import annotations
 
+import random
 from typing import Any, Dict, List
 
 import folium
 import streamlit as st
 from streamlit_folium import st_folium
 
+from live_data import (
+    BusPosition,
+    fetch_bus_positions,
+    pick_live_drivers,
+    pick_random_riders,
+    view_radius_m,
+)
 from map_adapter import MapRoutingAdapter
 from matching_engine import Driver, MatchingEngine, Rider
 
 # --- 常數 ---
 DEFAULT_MAP_CENTER = (25.0625, 121.5130)  # 大同區中心 (lat, lng)
 DEFAULT_MAP_ZOOM = 14                     # 區級視野
+MAP_WIDTH_PX = 1100
+MAP_HEIGHT_PX = 550
 # 點擊位置距最近路網節點超過此距離（公尺）就拒絕新增：
 # 路網外的點會被 nearest_nodes 硬吸附到區界節點，路徑會畫到完全錯誤的位置
 MAX_SNAP_DISTANCE_M = 250
 # 每組配對輪流使用的路線顏色（重疊路段才分得出是哪一組）
 PATH_COLORS = ["green", "purple", "orange", "darkred", "cadetblue"]
+# 即時範例的人數：司機多於乘客，才看得出演算法在挑「派哪幾位司機」最划算
+LIVE_DRIVER_COUNT = 6
+LIVE_RIDER_COUNT = 4
 
 # 預設範例：台北市各區地標（x=經度 lng, y=緯度 lat）
 EXAMPLE_DRIVERS = [
@@ -49,6 +64,12 @@ def load_adapter() -> MapRoutingAdapter:
     return MapRoutingAdapter()
 
 
+@st.cache_data(ttl=30, show_spinner="抓取臺北市公車即時位置中...")
+def load_bus_positions() -> List[BusPosition]:
+    """公車位置快取 30 秒：短時間內重複按按鈕不必重新下載。"""
+    return fetch_bus_positions()
+
+
 def init_session_state() -> None:
     """初始化展示台的所有狀態（僅在第一次執行時生效）。"""
     defaults: Dict[str, Any] = {
@@ -56,6 +77,7 @@ def init_session_state() -> None:
         "riders": [],             # List[Rider]
         "roadblocks": [],         # List[Tuple[float, float]]：封鎖路口 (lat, lng)
         "match_results": [],      # List[Dict]：配對結果與真實路徑
+        "driver_labels": {},      # Dict[str, str]：司機 id → 公車車牌（即時範例）
         "last_processed_click": None,  # 已處理過的點擊座標（去重用）
         "map_center": DEFAULT_MAP_CENTER,  # 目前地圖中心 (lat, lng)，跨 rerun 保留
         "map_zoom": DEFAULT_MAP_ZOOM,      # 目前地圖縮放，跨 rerun 保留
@@ -102,6 +124,51 @@ def run_matching(adapter: MapRoutingAdapter) -> None:
     st.session_state.match_results = match_results
 
 
+def load_live_example(adapter: MapRoutingAdapter) -> None:
+    """即時範例：目前地圖畫面內的公車即時位置當司機，隨機路口當乘客。
+
+    取樣半徑依目前縮放計算，確保標記都落在畫面內；公車須在路網
+    涵蓋範圍內（與點擊新增相同的吸附距離門檻），否則路徑會畫錯位置。
+    """
+    try:
+        buses = load_bus_positions()
+    except (OSError, ValueError) as error:
+        # 網路斷線、逾時、檔案格式錯誤都只提示，不讓整頁崩潰
+        st.error(f"無法取得公車即時資料（{error}），可以改按「載入預設範例」。")
+        return
+    if not buses:
+        st.warning("目前沒有營運中的公車（可能是深夜收班時段），請改按「載入預設範例」。")
+        return
+
+    center_lat, center_lng = st.session_state.map_center
+    radius = view_radius_m(center_lat, st.session_state.map_zoom, MAP_HEIGHT_PX)
+    rng = random.Random()
+    drivers, bus_ids = pick_live_drivers(
+        buses, center_lng, center_lat, radius, LIVE_DRIVER_COUNT, rng,
+        is_on_network=lambda x, y: adapter.snap_distance_m(x, y) <= MAX_SNAP_DISTANCE_M,
+    )
+    if not drivers:
+        st.warning(
+            f"目前地圖中心 {radius:,.0f} 公尺內沒有營運中的公車，"
+            "請把地圖移到台北市區再試。"
+        )
+        return
+
+    # 乘客從路網節點（路口）取樣，保證落在街道上
+    nodes = [(data["x"], data["y"]) for _, data in adapter.graph.nodes(data=True)]
+    riders = pick_random_riders(nodes, center_lng, center_lat, radius, LIVE_RIDER_COUNT, rng)
+
+    st.session_state.drivers = drivers
+    st.session_state.riders = riders
+    st.session_state.driver_labels = bus_ids
+    st.session_state.match_results = []
+    newest = max(bus.data_time for bus in buses)
+    st.success(
+        f"已載入 {len(drivers)} 輛公車的即時位置（資料時間 {newest:%H:%M:%S}）"
+        f"與 {len(riders)} 位隨機乘客，按「計算配對」開始派單。"
+    )
+
+
 def render_map() -> folium.Map:
     """依目前狀態畫地圖：藍=司機、紅=乘客、綠線=配對的真實路徑。"""
     # 初始視角用 session_state 保留的中心/縮放，st_folium 的 center/zoom
@@ -113,9 +180,10 @@ def render_map() -> folium.Map:
     )
 
     for driver in st.session_state.drivers:
+        bus_id = st.session_state.driver_labels.get(driver.id)
         folium.Marker(
             location=(driver.y, driver.x),  # folium 吃 (lat, lng)
-            tooltip=f"{driver.id}（司機）",
+            tooltip=f"{driver.id}（司機・公車 {bus_id}）" if bus_id else f"{driver.id}（司機）",
             icon=folium.Icon(color="blue", icon="car", prefix="fa"),
         ).add_to(fmap)
 
@@ -169,8 +237,13 @@ with st.sidebar:
     clear_clicked = st.button("清除所有資料 (Clear All)", use_container_width=True)
     example_clicked = st.button("載入預設範例 (Load Example)",
                                 use_container_width=True)
+    live_clicked = st.button("載入即時範例 (Live Example)",
+                             use_container_width=True)
     st.caption("提示：請在台北市範圍內點擊新增標記或封路，"
                "再按「計算配對」畫出真實行車路線；地圖會保持目前視角。")
+    st.caption("即時範例：叫車平台的司機位置沒有公開資料，這裡改用"
+               "[臺北市資料大平臺](https://data.taipei/)的公車即時 GPS "
+               "當作司機位置，乘客則在目前地圖畫面內隨機產生。")
 
 # --- 側邊欄按鈕處理（在渲染主畫面前先改完狀態）---
 if clear_clicked:
@@ -178,12 +251,17 @@ if clear_clicked:
     st.session_state.riders = []
     st.session_state.roadblocks = []
     st.session_state.match_results = []
+    st.session_state.driver_labels = {}
 
 if example_clicked:
     # list(...) 複製一份，避免使用者點擊時改到範例常數
     st.session_state.drivers = list(EXAMPLE_DRIVERS)
     st.session_state.riders = list(EXAMPLE_RIDERS)
     st.session_state.match_results = []
+    st.session_state.driver_labels = {}
+
+if live_clicked:
+    load_live_example(adapter)
 
 # --- 手動配對：按下「計算配對」才執行（內部會先套用最新封路狀態）---
 if run_clicked:
@@ -203,8 +281,8 @@ col_match.metric("配對成功", len(st.session_state.match_results))
 map_state = st_folium(
     render_map(),
     key="playground_map",
-    width=1100,
-    height=550,
+    width=MAP_WIDTH_PX,
+    height=MAP_HEIGHT_PX,
     center=st.session_state.map_center,  # 用保留的視角渲染，避免每次 rerun 跳回預設
     zoom=st.session_state.map_zoom,
     returned_objects=["last_clicked", "center", "zoom"],
