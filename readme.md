@@ -2,6 +2,12 @@
 
 **Real-Time Ride-Sharing Dispatch & Optimal Matching System**
 
+[![在 Streamlit 開啟](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://taipei-ride-matching.streamlit.app/)
+
+**線上 Demo**：<https://taipei-ride-matching.streamlit.app/> ｜ **原始碼**：<https://github.com/330Jason/ride-sharing-matching>
+
+> Demo 一段時間沒人使用會進入休眠，開啟後若看到喚醒畫面，按一下按鈕約一分鐘就會恢復。
+
 以匈牙利演算法求解司機與乘客的全域最低成本配對，串接台北市真實街道路網計算行車距離、支援動態封路繞道，並能抓取臺北市公車此刻的 GPS 位置當作司機，用真實車流測試派單。整套流程以事件驅動模擬器與互動式地圖展示。
 
 > 大學畢業專題
@@ -86,7 +92,7 @@ flowchart TB
 
 ## 快速開始
 
-需要 Python 3.11 以上（開發環境為 3.12）。
+不想安裝的話，直接開[線上 Demo](https://taipei-ride-matching.streamlit.app/) 就能操作。要在自己的電腦上跑，需要 Python 3.11 以上（開發環境為 3.12）：
 
 ```bash
 pip install -r requirements.txt
