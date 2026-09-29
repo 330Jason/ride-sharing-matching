@@ -108,17 +108,23 @@ def run_matching(adapter: MapRoutingAdapter) -> None:
     for result in results:
         driver = drivers_by_id[result.driver_id]
         rider = riders_by_id[result.rider_id]
-        # 街道路徑是「最近路網節點」之間的串列，與標記實際位置有小段
-        # 落差；頭尾補上司機/乘客座標，讓每條線都確實從藍色標記出發、
-        # 結束在紅色標記，不會和相鄰路徑黏在一起。
+        # 街道路徑從司機所在的路口走到乘客所在的路口，全程沿著道路形狀。
+        # 標記本身與最近路口之間還有一小段落差，那段不是道路（直接連線
+        # 會橫切過街廓），所以拆出來另外用虛線畫，不混進行駛路線裡。
         street_path = adapter.get_routing_path(driver, rider)
-        full_path = [(driver.y, driver.x)] + street_path + [(rider.y, rider.x)]
+        approach_lines = []
+        if street_path:
+            approach_lines = [
+                [(driver.y, driver.x), street_path[0]],
+                [street_path[-1], (rider.y, rider.x)],
+            ]
         match_results.append(
             {
                 "driver_id": result.driver_id,
                 "rider_id": result.rider_id,
                 "cost": result.cost,
-                "path": full_path,
+                "path": street_path,
+                "approach": approach_lines,
             }
         )
     st.session_state.match_results = match_results
@@ -206,10 +212,11 @@ def render_map() -> folium.Map:
     # 每一組配對各自實例化一個獨立的 PolyLine（絕不共用座標串列），
     # 並輪流配色，重疊路段才看得出分屬哪一組
     for index, match in enumerate(st.session_state.match_results):
+        color = PATH_COLORS[index % len(PATH_COLORS)]
         if match["path"]:
             folium.PolyLine(
                 locations=match["path"],
-                color=PATH_COLORS[index % len(PATH_COLORS)],
+                color=color,
                 weight=5,
                 opacity=0.85,
                 tooltip=(
@@ -217,13 +224,23 @@ def render_map() -> folium.Map:
                     f"（{match['cost']:.0f} 公尺）"
                 ),
             ).add_to(fmap)
+        # 標記與最近路口之間那段不是道路，用細虛線畫，避免看起來像穿越街廓
+        for approach in match.get("approach", []):
+            folium.PolyLine(
+                locations=approach,
+                color=color,
+                weight=2,
+                opacity=0.6,
+                dash_array="4,8",
+                tooltip="標記到最近路口（非道路）",
+            ).add_to(fmap)
 
     return fmap
 
 
 # --- 版面配置 ---
 st.set_page_config(page_title="共乘配對演算法展示台", layout="wide")
-st.title("🧪 共乘配對演算法展示台 — 台北市")
+st.title("共乘配對演算法展示台 — 台北市")
 
 init_session_state()
 adapter = load_adapter()

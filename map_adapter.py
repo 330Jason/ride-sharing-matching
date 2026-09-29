@@ -124,12 +124,16 @@ class MapRoutingAdapter:
     def get_routing_path(
         self, driver: Driver, rider: Rider
     ) -> List[Tuple[float, float]]:
-        """司機到乘客上車點的真實街道路徑，回傳沿途節點座標串列。
+        """司機到乘客上車點的真實街道路徑，回傳沿途座標串列。
 
         座標格式為 [(lat, lng), ...]——刻意採用 folium/leaflet 的
         (緯度, 經度) 順序，前端可直接餵給 folium.PolyLine 繪製。
         走 working_graph，因此會自動繞過已封鎖的路口；
         路網不通或起訖點被封鎖時回傳空串列。
+
+        路口之間照道路的實際形狀輸出：osmnx 簡化路網時會把彎道與繞行
+        的形狀存在邊的 geometry 屬性，只把路口連成直線會讓折線橫切過
+        街廓（實測有七成路線偏離真實道路超過 30 公尺）。
         """
         source = self._nearest_node(driver.x, driver.y)
         target = self._nearest_node(rider.x, rider.y)
@@ -139,11 +143,47 @@ class MapRoutingAdapter:
             )
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             return []
-        return [
-            (self.working_graph.nodes[node]["y"],
-             self.working_graph.nodes[node]["x"])
-            for node in node_ids
-        ]
+
+        path: List[Tuple[float, float]] = []
+        for u, v in zip(node_ids, node_ids[1:]):
+            for x, y in self._edge_shape(u, v):
+                point = (y, x)
+                # 相鄰兩段共用的路口只保留一次
+                if not path or path[-1] != point:
+                    path.append(point)
+        if not path:
+            # 起訖點吸附到同一個路口：沒有任何路段，只回傳該點
+            node = self.working_graph.nodes[source]
+            path.append((node["y"], node["x"]))
+        return path
+
+    def _edge_shape(self, u: int, v: int) -> List[Tuple[float, float]]:
+        """u→v 這段路的 (lng, lat) 形狀點串列，方向一律由 u 指向 v。
+
+        平行路段取最短的那條，與 shortest_path 的選擇一致；
+        沒有 geometry 的路段退回兩端路口的直線。
+        """
+        data = min(
+            self.working_graph.get_edge_data(u, v).values(),
+            key=lambda edge: edge.get("length", float("inf")),
+        )
+        start = (self.working_graph.nodes[u]["x"], self.working_graph.nodes[u]["y"])
+        end = (self.working_graph.nodes[v]["x"], self.working_graph.nodes[v]["y"])
+
+        geometry = data.get("geometry")
+        if geometry is None:
+            return [start, end]
+
+        coords = [(float(x), float(y)) for x, y in geometry.coords]
+
+        def gap_to_start(point: Tuple[float, float]) -> float:
+            return (point[0] - start[0]) ** 2 + (point[1] - start[1]) ** 2
+
+        # 雙向道路的兩個方向共用同一條 geometry，可能以相反方向儲存；
+        # 頭端離 u 較遠就整條反轉，確保折線從 u 走向 v
+        if gap_to_start(coords[0]) > gap_to_start(coords[-1]):
+            coords.reverse()
+        return coords
 
     def build_batch_cost_fn(
         self, drivers: List[Driver]
