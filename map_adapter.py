@@ -11,12 +11,32 @@ MatchingEngine 可注入的成本函式 (cost_fn)：
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
 
 import networkx as nx
 import osmnx as ox
+from shapely.geometry import LineString
+from shapely.ops import substring
 
 from matching_engine import Driver, Rider
+
+# 投影點與路段端點相距小於這個距離（經緯度）就視為就在該路口上。
+# 約等於 0.1 公釐，只用來吸收浮點誤差。
+ENDPOINT_TOLERANCE = 1e-9
+
+
+class EdgeSnap(NamedTuple):
+    """一個座標投影到路網上的結果。
+
+    u、v、key 是該路段在圖上的識別；line 是以 u→v 方向排列的道路形狀；
+    along 是投影點沿著 line 前進的距離（經緯度單位，僅用於切線段與算比例）。
+    """
+
+    u: int
+    v: int
+    key: int
+    line: LineString
+    along: float
 
 
 class MapRoutingAdapter:
@@ -45,6 +65,9 @@ class MapRoutingAdapter:
         # 同一個座標在一輪派單中會被查詢多次（n×m 個組合），
         # 快取「座標 → 最近節點」避免重複的最近鄰搜尋。
         self._node_cache: Dict[Tuple[float, float], int] = {}
+        # 「座標 → 最近路段投影」也快取：nearest_edges 每次呼叫都要重建
+        # 空間索引，單點就要 0.15 秒左右。封路改變時會一併清掉。
+        self._edge_cache: Dict[Tuple[float, float], Optional[EdgeSnap]] = {}
 
         # 套用封路後的「工作圖」：所有路由計算都走這張圖。
         # 尚未封路時直接指向原圖（共用、不複製），apply_roadblocks
@@ -61,6 +84,9 @@ class MapRoutingAdapter:
         所以解除封路（傳入空清單）可完全還原，重複封路也不會累積污染。
         移除節點會連帶切斷其所有相連的邊，後續路由自然繞道。
         """
+        # 投影結果綁在 working_graph 上，換圖就必須重算
+        self._edge_cache.clear()
+
         if not roadblock_coords:
             # 無封路：直接共用原圖，省下整張圖的複製成本
             self.working_graph = self.graph
@@ -128,62 +154,185 @@ class MapRoutingAdapter:
 
         座標格式為 [(lat, lng), ...]——刻意採用 folium/leaflet 的
         (緯度, 經度) 順序，前端可直接餵給 folium.PolyLine 繪製。
-        走 working_graph，因此會自動繞過已封鎖的路口；
-        路網不通或起訖點被封鎖時回傳空串列。
-
-        路口之間照道路的實際形狀輸出：osmnx 簡化路網時會把彎道與繞行
-        的形狀存在邊的 geometry 屬性，只把路口連成直線會讓折線橫切過
-        街廓（實測有七成路線偏離真實道路超過 30 公尺）。
         """
-        source = self._nearest_node(driver.x, driver.y)
-        target = self._nearest_node(rider.x, rider.y)
-        try:
-            node_ids = nx.shortest_path(
-                self.working_graph, source, target, weight="length"
-            )
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return self.route_shape(driver.x, driver.y, rider.x, rider.y)
+
+    def route_shape(
+        self, orig_x: float, orig_y: float, dest_x: float, dest_y: float
+    ) -> List[Tuple[float, float]]:
+        """兩個 (lng, lat) 座標之間的行車路線形狀，回傳 [(lat, lng), ...]。
+
+        路線從「起點所在路段上的實際位置」出發，全程沿著道路的實際形狀，
+        走到「終點最近的路邊位置」為止：
+        - 起訖點都投影到最近的路段（不是最近的路口）。乘客若在民宅裡，
+          終點就是該民宅的路邊上車點。
+        - 從投影點沿著該路段走到路口才接上主路徑；單行道只走順向，
+          要回頭就得繞路。
+        - 起訖在同一條路段且順向時，直接沿該路段連起來。
+        走 working_graph，因此會自動繞過已封鎖的路口；不可達時回傳空串列。
+        """
+        origin = self._snap_to_edge(orig_x, orig_y)
+        destination = self._snap_to_edge(dest_x, dest_y)
+        if origin is None or destination is None:
             return []
 
-        path: List[Tuple[float, float]] = []
-        for u, v in zip(node_ids, node_ids[1:]):
-            for x, y in self._edge_shape(u, v):
-                point = (y, x)
-                # 相鄰兩段共用的路口只保留一次
-                if not path or path[-1] != point:
-                    path.append(point)
-        if not path:
-            # 起訖點吸附到同一個路口：沒有任何路段，只回傳該點
-            node = self.working_graph.nodes[source]
-            path.append((node["y"], node["x"]))
-        return path
-
-    def _edge_shape(self, u: int, v: int) -> List[Tuple[float, float]]:
-        """u→v 這段路的 (lng, lat) 形狀點串列，方向一律由 u 指向 v。
-
-        平行路段取最短的那條，與 shortest_path 的選擇一致；
-        沒有 geometry 的路段退回兩端路口的直線。
-        """
-        data = min(
-            self.working_graph.get_edge_data(u, v).values(),
-            key=lambda edge: edge.get("length", float("inf")),
+        same_edge = (origin.u, origin.v, origin.key) == (
+            destination.u, destination.v, destination.key
         )
-        start = (self.working_graph.nodes[u]["x"], self.working_graph.nodes[u]["y"])
-        end = (self.working_graph.nodes[v]["x"], self.working_graph.nodes[v]["y"])
+        if same_edge and origin.along <= destination.along:
+            return self._to_latlng(
+                self._coords(substring(origin.line, origin.along, destination.along))
+            )
+
+        best_cost = float("inf")
+        best_shape: List[Tuple[float, float]] = []
+        for start_node, head_shape, head_cost in self._departures(origin):
+            for end_node, tail_shape, tail_cost in self._arrivals(destination):
+                try:
+                    middle_cost, node_ids = nx.single_source_dijkstra(
+                        self.working_graph, start_node, end_node, weight="length"
+                    )
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+                total = head_cost + float(middle_cost) + tail_cost
+                if total >= best_cost:
+                    continue
+                middle_shape: List[Tuple[float, float]] = []
+                for u, v in zip(node_ids, node_ids[1:]):
+                    middle_shape.extend(self._edge_shape(u, v))
+                best_cost = total
+                best_shape = head_shape + middle_shape + tail_shape
+
+        return self._to_latlng(best_shape)
+
+    # ------------------------------------------------------------------
+    # 路段投影與形狀
+    # ------------------------------------------------------------------
+
+    def _snap_to_edge(self, x: float, y: float) -> Optional[EdgeSnap]:
+        """把 (lng, lat) 投影到最近的「路段」上（不是最近的路口）。"""
+        key = (x, y)
+        if key not in self._edge_cache:
+            try:
+                u, v, edge_key = ox.distance.nearest_edges(
+                    self.working_graph, X=x, Y=y
+                )
+                line = self._edge_line(u, v, edge_key)
+                along = float(line.project(_point(x, y)))
+                self._edge_cache[key] = EdgeSnap(u, v, edge_key, line, along)
+            except (ValueError, KeyError, nx.NetworkXError):
+                self._edge_cache[key] = None
+        return self._edge_cache[key]
+
+    def _edge_line(self, u: int, v: int, key: int) -> LineString:
+        """u→v 這條路段的形狀，方向一律由 u 指向 v。
+
+        沒有 geometry 的路段（osmnx 未簡化的直線段）退回兩端路口的直線。
+        """
+        data = self.working_graph.edges[u, v, key]
+        start = (
+            self.working_graph.nodes[u]["x"], self.working_graph.nodes[u]["y"]
+        )
+        end = (
+            self.working_graph.nodes[v]["x"], self.working_graph.nodes[v]["y"]
+        )
 
         geometry = data.get("geometry")
         if geometry is None:
-            return [start, end]
+            return LineString([start, end])
 
-        coords = [(float(x), float(y)) for x, y in geometry.coords]
+        coords = [(float(px), float(py)) for px, py in geometry.coords]
 
         def gap_to_start(point: Tuple[float, float]) -> float:
             return (point[0] - start[0]) ** 2 + (point[1] - start[1]) ** 2
 
-        # 雙向道路的兩個方向共用同一條 geometry，可能以相反方向儲存；
-        # 頭端離 u 較遠就整條反轉，確保折線從 u 走向 v
+        # 雙向道路的兩個方向可能共用同一條 geometry，存的方向不一定相同；
+        # 頭端離 u 較遠就整條反轉，確保形狀是從 u 走向 v
         if gap_to_start(coords[0]) > gap_to_start(coords[-1]):
             coords.reverse()
-        return coords
+        return LineString(coords)
+
+    def _edge_shape(self, u: int, v: int) -> List[Tuple[float, float]]:
+        """u→v 的 (lng, lat) 形狀點串列；平行路段取與最短路徑相同的最短那條。"""
+        edges = self.working_graph.get_edge_data(u, v)
+        key = min(edges, key=lambda k: edges[k].get("length", float("inf")))
+        return list(self._edge_line(u, v, key).coords)
+
+    def _edge_length_m(self, snap: EdgeSnap) -> float:
+        """投影所在路段的實際長度（公尺）。"""
+        data = self.working_graph.edges[snap.u, snap.v, snap.key]
+        return float(data.get("length", 0.0))
+
+    def _departures(
+        self, snap: EdgeSnap
+    ) -> List[Tuple[int, List[Tuple[float, float]], float]]:
+        """從投影點出發可以先到哪些路口。
+
+        回傳 [(路口 id, 到該路口的形狀, 距離公尺), ...]。
+        順向一定可走；逆向只有在該路段存在反向邊（雙向道路）時才可走，
+        因此單行道不會被逆向行駛。
+        """
+        total = snap.line.length
+        first, last = self._coords(snap.line)[0], self._coords(snap.line)[-1]
+        if total <= 0 or snap.along <= ENDPOINT_TOLERANCE:
+            return [(snap.u, [first], 0.0)]
+        if snap.along >= total - ENDPOINT_TOLERANCE:
+            return [(snap.v, [last], 0.0)]
+
+        length_m = self._edge_length_m(snap)
+        ratio = snap.along / total
+        options = [(
+            snap.v,
+            self._coords(substring(snap.line, snap.along, total)),
+            length_m * (1 - ratio),
+        )]
+        if self.working_graph.has_edge(snap.v, snap.u):
+            backward = self._coords(substring(snap.line, 0, snap.along))[::-1]
+            options.append((snap.u, backward, length_m * ratio))
+        return options
+
+    def _arrivals(
+        self, snap: EdgeSnap
+    ) -> List[Tuple[int, List[Tuple[float, float]], float]]:
+        """可以從哪些路口沿路段走到投影點（上車點）。
+
+        回傳 [(路口 id, 從該路口到投影點的形狀, 距離公尺), ...]。
+        """
+        total = snap.line.length
+        first, last = self._coords(snap.line)[0], self._coords(snap.line)[-1]
+        if total <= 0 or snap.along <= ENDPOINT_TOLERANCE:
+            return [(snap.u, [first], 0.0)]
+        if snap.along >= total - ENDPOINT_TOLERANCE:
+            return [(snap.v, [last], 0.0)]
+
+        length_m = self._edge_length_m(snap)
+        ratio = snap.along / total
+        options = [(
+            snap.u,
+            self._coords(substring(snap.line, 0, snap.along)),
+            length_m * ratio,
+        )]
+        if self.working_graph.has_edge(snap.v, snap.u):
+            backward = self._coords(substring(snap.line, snap.along, total))[::-1]
+            options.append((snap.v, backward, length_m * (1 - ratio)))
+        return options
+
+    @staticmethod
+    def _coords(geometry) -> List[Tuple[float, float]]:
+        """shapely 幾何轉成 (lng, lat) 串列；起訖相同時 substring 會回傳一個點。"""
+        return [(float(x), float(y)) for x, y in geometry.coords]
+
+    @staticmethod
+    def _to_latlng(
+        points: List[Tuple[float, float]]
+    ) -> List[Tuple[float, float]]:
+        """(lng, lat) 串列轉成 folium 的 (lat, lng)，並去掉連續重複的點。"""
+        path: List[Tuple[float, float]] = []
+        for x, y in points:
+            point = (y, x)
+            if not path or path[-1] != point:
+                path.append(point)
+        return path
 
     def build_batch_cost_fn(
         self, drivers: List[Driver]
@@ -221,6 +370,13 @@ class MapRoutingAdapter:
         return batch_cost_fn
 
 
+def _point(x: float, y: float):
+    """延後 import，避免模組層多一個 shapely 名稱。"""
+    from shapely.geometry import Point
+
+    return Point(x, y)
+
+
 if __name__ == "__main__":
     from matching_engine import MatchingEngine
 
@@ -254,10 +410,16 @@ if __name__ == "__main__":
     # 4. 執行配對並印出結果
     results = engine.match(drivers, riders)
 
+    drivers_by_id = {d.id: d for d in drivers}
+    riders_by_id = {r.id: r for r in riders}
+
     print("\n=== Match Results ===")
     for result in results:
+        path = adapter.get_routing_path(
+            drivers_by_id[result.driver_id], riders_by_id[result.rider_id]
+        )
         print(f"  {result.driver_id} -> {result.rider_id}  "
-              f"(行車距離 = {result.cost:.0f} 公尺)")
+              f"(行車距離 = {result.cost:.0f} 公尺, 路線 {len(path)} 個點)")
 
     total_cost = sum(result.cost for result in results)
     print(f"\nTotal system cost: {total_cost:.0f} 公尺")

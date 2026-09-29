@@ -108,15 +108,19 @@ def run_matching(adapter: MapRoutingAdapter) -> None:
     for result in results:
         driver = drivers_by_id[result.driver_id]
         rider = riders_by_id[result.rider_id]
-        # 街道路徑從司機所在的路口走到乘客所在的路口，全程沿著道路形狀。
-        # 標記本身與最近路口之間還有一小段落差，那段不是道路（直接連線
-        # 會橫切過街廓），所以拆出來另外用虛線畫，不混進行駛路線裡。
+        # 街道路徑從司機在路段上的實際位置出發，全程沿著道路形狀，
+        # 走到乘客可上車的路邊位置為止。乘客若在民宅裡，路邊上車點與
+        # 紅色標記之間還有一小段步行距離，那段不是行車路線，另外用虛線畫。
         street_path = adapter.get_routing_path(driver, rider)
         approach_lines = []
         if street_path:
             approach_lines = [
-                [(driver.y, driver.x), street_path[0]],
-                [street_path[-1], (rider.y, rider.x)],
+                [marker, endpoint]
+                for marker, endpoint in (
+                    ((driver.y, driver.x), street_path[0]),
+                    ((rider.y, rider.x), street_path[-1]),
+                )
+                if marker != endpoint
             ]
         match_results.append(
             {
@@ -224,15 +228,15 @@ def render_map() -> folium.Map:
                     f"（{match['cost']:.0f} 公尺）"
                 ),
             ).add_to(fmap)
-        # 標記與最近路口之間那段不是道路，用細虛線畫，避免看起來像穿越街廓
+        # 路邊上車點到標記之間是步行段，不是行車路線，用明顯的虛線標示
         for approach in match.get("approach", []):
             folium.PolyLine(
                 locations=approach,
                 color=color,
-                weight=2,
-                opacity=0.6,
-                dash_array="4,8",
-                tooltip="標記到最近路口（非道路）",
+                weight=3,
+                opacity=0.9,
+                dash_array="6,6",
+                tooltip="路邊上車點到標記位置（步行，非行車路線）",
             ).add_to(fmap)
 
     return fmap
