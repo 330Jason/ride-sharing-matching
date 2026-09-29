@@ -162,6 +162,28 @@ python3 -m pytest
 - 公車資料解析：營運狀態過濾、無效座標與時間、過時紀錄、損壞的下載檔
 - 即時取樣：只取半徑內且在路網上的公車、路網外的公車不佔名額、同一個亂數種子結果可重現
 
+## 開發流程
+
+專案分成兩條線，穩定版隨時可用，開發中的改動不會影響它：
+
+| 分支   | 用途                                 | 部署                                            |
+| ------ | ------------------------------------ | ----------------------------------------------- |
+| `main` | 穩定版，隨時可以給別人使用           | <https://taipei-ride-matching.streamlit.app/>   |
+| `dev`  | 開發與測試，改壞了也不影響穩定版     | 另一個從 `dev` 分支部署的測試用 app             |
+
+1. 在 `dev` 分支修改，`git push` 後測試網址會自動重新部署
+2. 本機用 `python3 -m pytest` 與 `python3 -m streamlit run app.py` 確認
+3. 確認沒問題後合併回 `main`，穩定版網址跟著更新：
+
+```bash
+git checkout main
+git merge dev     # dev 的內容覆蓋成穩定版
+git push          # 穩定版網站自動重新部署
+git checkout dev  # 回到開發分支繼續改
+```
+
+推送到 `dev` 只會重建測試用 app，穩定版網站不受影響——兩個 app 各自綁定自己的分支。
+
 ## 技術棧
 
 Python 3.12 · NumPy · SciPy · NetworkX · OSMnx · Shapely · Streamlit · Folium · pytest
