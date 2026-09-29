@@ -176,7 +176,9 @@ def render_map() -> folium.Map:
     fmap = folium.Map(
         location=st.session_state.map_center,
         zoom_start=st.session_state.map_zoom,
-        tiles="cartodbpositron",
+        # CARTO 的淺色底圖改成需要 API key（放大後整片都是 API KEY REQUIRED 浮水印），
+        # 改用 OpenStreetMap 官方圖磚：免金鑰，各級縮放都有真實圖資
+        tiles="OpenStreetMap",
     )
 
     for driver in st.session_state.drivers:
